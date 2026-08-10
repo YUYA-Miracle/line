@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +30,15 @@ import (
 const (
 	prefetchMessagesConcurrency               = 4
 	messageBoxPageLimit                       = 100
-	startupBackfillMessageLimit               = 50
+	// defaultStartupBackfillMessageLimit is the per-chat message count requested
+	// from LINE's getRecentMessagesV2 RPC during startup backfill. LINE's
+	// TalkService protocol (see docs/history-backfill-research.md) exposes no
+	// known cursor/older-history pagination RPC for regular 1:1/group chats, so
+	// this is a single-shot request, not a page size. Its server-side ceiling
+	// is unverified; it can be overridden via LINE_STARTUP_BACKFILL_LIMIT for a
+	// controlled, read-only probe against a real account before changing the
+	// default (see the same doc for the required probe procedure).
+	defaultStartupBackfillMessageLimit        = 50
 	unblockBackfillPortalWaitTimeout          = time.Minute
 	unblockBackfillPortalPollInterval         = 500 * time.Millisecond
 	unblockBackfillFrameworkGrace             = 10 * time.Second
@@ -38,6 +47,23 @@ const (
 	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
 	defaultReceiveAuthProbeInterval           = 150 * time.Second
 )
+
+// resolveStartupBackfillMessageLimit parses LINE_STARTUP_BACKFILL_LIMIT into a
+// per-chat message count for startup backfill. An empty, unparsable, or
+// out-of-range value falls back to defaultStartupBackfillMessageLimit. The
+// upper bound (1000) is a local safety clamp, not a confirmed server limit —
+// LINE's actual ceiling for getRecentMessagesV2 has not been probed against a
+// real account (see docs/history-backfill-research.md, Child A in issue #307).
+func resolveStartupBackfillMessageLimit(raw string) int {
+	if raw == "" {
+		return defaultStartupBackfillMessageLimit
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || parsed < 1 || parsed > 1000 {
+		return defaultStartupBackfillMessageLimit
+	}
+	return parsed
+}
 
 var (
 	errReceiveAuthProbeDue               = errors.New("receive auth probe due")
@@ -99,6 +125,11 @@ func (state *unblockBackfillState) complete() {
 type manualUnblockBackfillContextKey struct{}
 
 var (
+	// startupBackfillMessageLimit is resolved once at package init from
+	// LINE_STARTUP_BACKFILL_LIMIT (clamped to [1, 1000]), falling back to
+	// defaultStartupBackfillMessageLimit. See the const doc comment above.
+	startupBackfillMessageLimit = resolveStartupBackfillMessageLimit(os.Getenv("LINE_STARTUP_BACKFILL_LIMIT"))
+
 	getLastOpRevisionWithClient = func(ctx context.Context, client *line.Client) (int64, error) {
 		return client.GetLastOpRevisionContext(ctx)
 	}
@@ -807,13 +838,25 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 			}
 		}
 	}
-	lc.UserLogin.Bridge.Log.Debug().
+	// possiblyTruncated is a best-effort signal, not a confirmed fact: LINE's
+	// getRecentMessagesV2 has no documented "hasMore" indicator, so a full
+	// batch (fetched == limit) only means the requested window was filled, not
+	// that older history does or doesn't exist beyond it. It must never be
+	// read as "history.complete" for the chat; see docs/history-backfill-research.md.
+	possiblyTruncated := len(msgs) == limit
+	logEvent := lc.UserLogin.Bridge.Log.Debug()
+	if possiblyTruncated {
+		logEvent = lc.UserLogin.Bridge.Log.Info()
+	}
+	logEvent.
 		Str("chat_mid", chatMID).
+		Int("requested_limit", limit).
 		Int("fetched", len(msgs)).
 		Int("queued", queued).
 		Int("system_events", systemEvents).
 		Int("reaction_syncs", reactionSyncs).
 		Int("skipped_existing", skippedExisting).
+		Bool("possibly_truncated", possiblyTruncated).
 		Dur("duration", time.Since(start)).
 		Msg("Finished recent-message backfill")
 	return systemEvents > 0

@@ -211,6 +211,36 @@ func installManualReceiveAuthProbeDeadline(t *testing.T) <-chan context.CancelCa
 	return cancels
 }
 
+func TestResolveStartupBackfillMessageLimitDefaultsWhenEmpty(t *testing.T) {
+	if got := resolveStartupBackfillMessageLimit(""); got != defaultStartupBackfillMessageLimit {
+		t.Fatalf("expected default limit %d for empty input, got %d", defaultStartupBackfillMessageLimit, got)
+	}
+}
+
+func TestResolveStartupBackfillMessageLimitAcceptsValidOverride(t *testing.T) {
+	if got := resolveStartupBackfillMessageLimit("200"); got != 200 {
+		t.Fatalf("expected overridden limit 200, got %d", got)
+	}
+}
+
+func TestResolveStartupBackfillMessageLimitRejectsOutOfRange(t *testing.T) {
+	cases := []string{"0", "-1", "1001", "not-a-number", "  "}
+	for _, raw := range cases {
+		if got := resolveStartupBackfillMessageLimit(raw); got != defaultStartupBackfillMessageLimit {
+			t.Fatalf("input %q: expected fallback to default %d, got %d", raw, defaultStartupBackfillMessageLimit, got)
+		}
+	}
+}
+
+func TestResolveStartupBackfillMessageLimitClampsBoundaries(t *testing.T) {
+	if got := resolveStartupBackfillMessageLimit("1"); got != 1 {
+		t.Fatalf("expected boundary value 1 to be accepted, got %d", got)
+	}
+	if got := resolveStartupBackfillMessageLimit("1000"); got != 1000 {
+		t.Fatalf("expected boundary value 1000 to be accepted, got %d", got)
+	}
+}
+
 func TestDefaultReceiveAuthProbeIntervalIs150Seconds(t *testing.T) {
 	if defaultReceiveAuthProbeInterval != 150*time.Second {
 		t.Fatalf("default receive auth probe interval = %s, want 150s", defaultReceiveAuthProbeInterval)
