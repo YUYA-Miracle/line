@@ -1,0 +1,23 @@
+name: Go test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pkg/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/go-test.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.25-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache build-base olm-dev git
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
