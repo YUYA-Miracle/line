@@ -4,13 +4,19 @@ package connector
 type OperationType int
 
 const (
-	OpSendMessage            OperationType = 25
-	OpReceiveMessage         OperationType = 26
-	OpSendChatRemoved        OperationType = 41
-	OpContactUpdate          OperationType = 49
-	OpReadReceipt            OperationType = 55
-	OpNotifiedJoinChat       OperationType = 60
-	OpNotifiedLeaveChat      OperationType = 61
+	OpSendMessage       OperationType = 25
+	OpReceiveMessage    OperationType = 26
+	OpSendChatRemoved   OperationType = 41
+	OpContactUpdate     OperationType = 49
+	OpReadReceipt       OperationType = 55
+	OpNotifiedJoinChat  OperationType = 60
+	OpNotifiedLeaveChat OperationType = 61
+	// OpNotifiedTyping (62) has always been on the wire — every third-party
+	// LINE client reference (linepy's OpType table, evex-dev/linejs's
+	// line.thrift, nmt3325/line-web's live handler) agrees on 62, and this
+	// bridge has simply never dispatched it. Verified against nmt3325/line-web
+	// server.js: param1 is the chat mid, param2 is the typer's user mid.
+	OpNotifiedTyping         OperationType = 62
 	OpUnsendLocal            OperationType = 64
 	OpUnsendRemote           OperationType = 65
 	OpChatUpdate             OperationType = 121
