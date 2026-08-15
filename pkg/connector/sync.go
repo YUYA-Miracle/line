@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	prefetchMessagesConcurrency               = 4
-	messageBoxPageLimit                       = 100
+	prefetchMessagesConcurrency = 4
+	messageBoxPageLimit         = 100
 	// defaultStartupBackfillMessageLimit is the per-chat message count requested
 	// from LINE's getRecentMessagesV2 RPC during startup backfill. LINE's
 	// TalkService protocol (see docs/history-backfill-research.md) exposes no
