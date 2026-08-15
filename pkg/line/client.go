@@ -807,6 +807,20 @@ func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, servic
 	// Chrome preflights object_info.obs before downloading media. This is
 	// important because a missing object and an object that is still encoding
 	// require different bridge behavior.
+	//
+	// "notexist" is retried the same as "encoding": a self-sent file's object
+	// can report notexist for a moment while LINE's OBS write is still
+	// propagating to the replica object_info reads, arriving before the
+	// upload it echoes has fully landed. Measured in production: a
+	// self-outgoing file bridged via the SEND_MESSAGE echo failed with a
+	// confirmed "notexist" within ~2s of being sent, while the same file type
+	// received from a counterpart (a normal, non-echo receive) downloaded
+	// successfully — the timing points at a propagation race specific to the
+	// echo path, not a real deletion. Retrying costs nothing when the object
+	// really is gone (identical outcome after exhaustion, just later), so
+	// treating notexist as retryable-then-final here does not weaken the
+	// "known expiry" guarantee mediaDownloadFailure depends on — it just gives
+	// a genuine race a chance to resolve before that guarantee is invoked.
 	for attempt := 0; attempt <= obsMaxRetries; attempt++ {
 		err = c.checkOBSObjectReady(ctx, objectInfoURL, obsToken, messageID)
 		if err == nil {
@@ -816,18 +830,18 @@ func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, servic
 				return data, nil
 			}
 		}
-		if !errors.Is(err, ErrOBSEncodingIncomplete) {
+		if !errors.Is(err, ErrOBSEncodingIncomplete) && !errors.Is(err, ErrOBSObjectNotFound) {
 			return nil, err
 		}
 		if attempt >= obsMaxRetries {
-			return nil, fmt.Errorf("%w after %d retries", ErrOBSEncodingIncomplete, obsMaxRetries)
+			return nil, fmt.Errorf("%w after %d retries", err, obsMaxRetries)
 		}
 		if err = waitForOBSRetry(ctx); err != nil {
 			return nil, err
 		}
 	}
 
-	return nil, fmt.Errorf("%w after %d retries", ErrOBSEncodingIncomplete, obsMaxRetries)
+	return nil, fmt.Errorf("%w after %d retries", err, obsMaxRetries)
 }
 
 type obsObjectInfo struct {

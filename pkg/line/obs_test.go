@@ -240,10 +240,15 @@ func TestDownloadOBSWaitsForObjectEncoding(t *testing.T) {
 
 func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
 	installCachedOBSToken(t)
+	oldDelay := obsRetryDelay
+	obsRetryDelay = 0
+	t.Cleanup(func() { obsRetryDelay = oldDelay })
 
+	var requests int
 	client := NewClient("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
 			return obsResponse(http.StatusOK, `{"status":"notexist"}`), nil
 		}),
 	}
@@ -251,6 +256,49 @@ func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
 	_, err := client.DownloadOBSWithSIDOptions(context.Background(), "message-id", "", "m", OBSDownloadOptions{})
 	if !errors.Is(err, ErrOBSObjectNotFound) {
 		t.Fatalf("err = %v, want ErrOBSObjectNotFound", err)
+	}
+	if requests != obsMaxRetries+1 {
+		t.Fatalf("requests = %d, want %d (a persistent notexist is retried the same as encoding-incomplete before being materialized as known expiry)", requests, obsMaxRetries+1)
+	}
+}
+
+// TestDownloadOBSRecoversFromTransientMissingObject locks in the actual fix:
+// a self-sent file's object_info can report "notexist" for a moment while
+// LINE's OBS write is still propagating (measured in production — see the
+// comment on downloadOBSWithServiceAndSIDOptions). If the object starts
+// reporting "exist" before retries are exhausted, the download must succeed
+// instead of falling through to the "expired" notice.
+func TestDownloadOBSRecoversFromTransientMissingObject(t *testing.T) {
+	installCachedOBSToken(t)
+	oldDelay := obsRetryDelay
+	obsRetryDelay = 0
+	t.Cleanup(func() { obsRetryDelay = oldDelay })
+
+	var paths []string
+	client := NewClient("line-token")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			paths = append(paths, req.URL.Path)
+			switch len(paths) {
+			case 1:
+				return obsResponse(http.StatusOK, `{"status":"notexist"}`), nil
+			case 2:
+				return obsResponse(http.StatusOK, `{"status":"exist","encodeStatus":"done"}`), nil
+			default:
+				return obsResponse(http.StatusOK, "ready"), nil
+			}
+		}),
+	}
+
+	data, err := client.DownloadOBSWithSIDOptions(context.Background(), "message-id", "", "m", OBSDownloadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ready" {
+		t.Fatalf("data = %q, want ready", data)
+	}
+	if len(paths) != 3 {
+		t.Fatalf("requests = %d, want 3 (retry object_info once, then download)", len(paths))
 	}
 }
 
