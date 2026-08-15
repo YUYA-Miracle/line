@@ -1917,6 +1917,36 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			lc.handleMemberLeft(op.Param2, op.Param1)
 		}
 
+	case OpNotifiedTyping:
+		// param1 = chat mid, param2 = the typing user's mid (verified against
+		// nmt3325/line-web's live handler for this exact op type — this
+		// bridge never dispatched it before, so there is no prior internal
+		// convention to match). Skip our own echo: FABULA already knows its
+		// own typing state locally (it is what triggered the native app to
+		// report it back), and relaying it would just be a slower, redundant
+		// copy of what markConversationRead's own typing signal already sent.
+		chatMid, typerMid := op.Param1, op.Param2
+		if chatMid == "" || typerMid == "" || lc.isOwnMID(typerMid) {
+			return
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Typing{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventTyping,
+				PortalKey: networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID},
+				Sender:    lc.eventSenderForMID(typerMid),
+				Timestamp: time.Now(),
+			},
+			// LINE's NOTIFIED_TYPING carries no explicit stop event or duration
+			// in any of the reference implementations checked; the recipient
+			// infers a timeout instead. 10s is shorter than Matrix's 30s spec
+			// default on purpose: a LINE contact who stops typing without
+			// sending (closes the chat, gets distracted) would otherwise leave
+			// a stale indicator up three times longer than they were actually
+			// typing, with nothing to correct it until the next EDU arrives.
+			Timeout: 10 * time.Second,
+			Type:    bridgev2.TypingTypeText,
+		})
+
 	case OpNotifiedJoinChat:
 		lc.handleMemberJoin(op.Param1, op.Param2)
 
