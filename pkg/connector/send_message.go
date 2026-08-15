@@ -834,6 +834,23 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	// LINE tracks "read up to" as a server-side cursor advanced by an explicit
+	// sendChatChecked call (see HandleMatrixReadReceipt); it is never inferred
+	// from having sent a message. A native client advances its own cursor as a
+	// side effect of sending, but this bridge is just another client session
+	// on the account, so without this call the official LINE apps compute the
+	// chat's unread count from that stale cursor and count our own outgoing
+	// message as unread. Best-effort: the message itself already sent
+	// successfully, so a failure here must not surface as a send failure.
+	if err := callLineErr(func(client *line.Client) error {
+		return client.SendChatChecked(portalMid, sentMsg.ID)
+	}); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).
+			Str("chat_mid", portalMid).
+			Str("message_id", sentMsg.ID).
+			Msg("Failed to mark own outgoing message as checked")
+	}
+
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        networkid.MessageID(sentMsg.ID),
