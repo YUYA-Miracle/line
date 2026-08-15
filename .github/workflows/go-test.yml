@@ -19,5 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: apk add --no-cache build-base olm-dev git
       - run: go build ./...
-      - run: go vet ./...
+      # pkg/ltsm is generated thrift bindings with pre-existing vet noise
+      # (self-assignment, unreachable code) unrelated to any hand-written
+      # code here; vet everything else.
+      - run: go vet $(go list ./... | grep -v '/pkg/ltsm$')
       - run: go test ./...
