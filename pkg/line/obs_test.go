@@ -238,11 +238,17 @@ func TestDownloadOBSWaitsForObjectEncoding(t *testing.T) {
 	}
 }
 
+func zeroedOBSNotFoundRetryDelays(t *testing.T) {
+	t.Helper()
+	old := obsNotFoundRetryDelays
+	fast := make([]time.Duration, len(old))
+	obsNotFoundRetryDelays = fast
+	t.Cleanup(func() { obsNotFoundRetryDelays = old })
+}
+
 func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
 	installCachedOBSToken(t)
-	oldDelay := obsRetryDelay
-	obsRetryDelay = 0
-	t.Cleanup(func() { obsRetryDelay = oldDelay })
+	zeroedOBSNotFoundRetryDelays(t)
 
 	var requests int
 	client := NewClient("line-token")
@@ -257,8 +263,27 @@ func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
 	if !errors.Is(err, ErrOBSObjectNotFound) {
 		t.Fatalf("err = %v, want ErrOBSObjectNotFound", err)
 	}
-	if requests != obsMaxRetries+1 {
-		t.Fatalf("requests = %d, want %d (a persistent notexist is retried the same as encoding-incomplete before being materialized as known expiry)", requests, obsMaxRetries+1)
+	wantRequests := len(obsNotFoundRetryDelays) + 1
+	if requests != wantRequests {
+		t.Fatalf("requests = %d, want %d (a persistent notexist is retried across the full TASK-260 backoff schedule before being materialized as known expiry)", requests, wantRequests)
+	}
+}
+
+// TestDownloadOBSNotFoundUsesOwnBackoffSchedule locks in the TASK-260 retry
+// budget itself: a persistent notexist must be retried len(obsNotFoundRetryDelays)
+// times using exactly that schedule (not obsMaxRetries/obsRetryDelay, which
+// remains reserved for ErrOBSEncodingIncomplete), and the schedule's total
+// must land in the ~60-90s window the task targeted.
+func TestDownloadOBSNotFoundUsesOwnBackoffSchedule(t *testing.T) {
+	if len(obsNotFoundRetryDelays) <= obsMaxRetries {
+		t.Fatalf("len(obsNotFoundRetryDelays) = %d, want a materially longer budget than obsMaxRetries = %d", len(obsNotFoundRetryDelays), obsMaxRetries)
+	}
+	var total time.Duration
+	for _, d := range obsNotFoundRetryDelays {
+		total += d
+	}
+	if total < 60*time.Second || total > 90*time.Second {
+		t.Fatalf("obsNotFoundRetryDelays total = %v, want roughly 60s-90s", total)
 	}
 }
 
@@ -270,9 +295,7 @@ func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
 // instead of falling through to the "expired" notice.
 func TestDownloadOBSRecoversFromTransientMissingObject(t *testing.T) {
 	installCachedOBSToken(t)
-	oldDelay := obsRetryDelay
-	obsRetryDelay = 0
-	t.Cleanup(func() { obsRetryDelay = oldDelay })
+	zeroedOBSNotFoundRetryDelays(t)
 
 	var paths []string
 	client := NewClient("line-token")

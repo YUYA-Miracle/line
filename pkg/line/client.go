@@ -37,6 +37,45 @@ const (
 var (
 	obsRetryDelay = 2 * time.Second
 
+	// obsNotFoundRetryDelays is the backoff schedule used specifically when
+	// object_info.obs reports "notexist" (ErrOBSObjectNotFound), as opposed
+	// to the flat obsMaxRetries/obsRetryDelay window (~10s total) used for
+	// ErrOBSEncodingIncomplete, an already-confirmed-exist object still being
+	// transcoded.
+	//
+	// TASK-260 (production, 2026-08): a video from a LINE official/business
+	// account broadcast bridged as "expired" after exhausting the ~10s
+	// notexist retry window TASK-248 added for the self-sent-echo race. The
+	// SSE push for that message itself arrived ~28-30s after its own
+	// remote_timestamp (no reconnect/backoff observed — the delay is on
+	// LINE's OA broadcast fan-out/delivery side, not this bridge), so by the
+	// time the bridge even started downloading, an object that might still
+	// have been mid-encode had already burned most of a 10s budget. The
+	// TASK-248 window was sized for the self-echo propagation race (typically
+	// resolves within one 2s retry) and was never validated against OA
+	// broadcast-scale encoding/propagation times, which are plausibly an
+	// order of magnitude slower given the fan-out involved. This schedule
+	// keeps the original short probes (in case it's still the ordinary
+	// TASK-248 race) but adds a plateau of 15s probes to give OA-scale
+	// encoding/propagation room to finish, capped at ~89s total so a
+	// genuinely deleted object still fails within about a minute and a half
+	// rather than retrying indefinitely. This is an empirical bet, not a
+	// documented LINE guarantee — the protocol gives no signal beyond
+	// "notexist" to distinguish "still encoding" from "actually gone", so
+	// the next real OA/broadcast video or image is the only way to confirm
+	// whether this window is long enough (see upstream.env for the
+	// production-verification note on this pin).
+	obsNotFoundRetryDelays = []time.Duration{
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		15 * time.Second,
+		15 * time.Second,
+		15 * time.Second,
+		15 * time.Second,
+		15 * time.Second,
+	} // sum = 89s across 8 retries (9 total attempts)
+
 	ErrOBSObjectNotFound     = errors.New("LINE OBS object not found")
 	ErrOBSEncodingIncomplete = errors.New("LINE OBS object encoding incomplete")
 	ErrOBSObjectValidation   = errors.New("LINE OBS object validation failed")
@@ -808,20 +847,21 @@ func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, servic
 	// important because a missing object and an object that is still encoding
 	// require different bridge behavior.
 	//
-	// "notexist" is retried the same as "encoding": a self-sent file's object
-	// can report notexist for a moment while LINE's OBS write is still
-	// propagating to the replica object_info reads, arriving before the
-	// upload it echoes has fully landed. Measured in production: a
-	// self-outgoing file bridged via the SEND_MESSAGE echo failed with a
-	// confirmed "notexist" within ~2s of being sent, while the same file type
-	// received from a counterpart (a normal, non-echo receive) downloaded
-	// successfully — the timing points at a propagation race specific to the
-	// echo path, not a real deletion. Retrying costs nothing when the object
-	// really is gone (identical outcome after exhaustion, just later), so
-	// treating notexist as retryable-then-final here does not weaken the
-	// "known expiry" guarantee mediaDownloadFailure depends on — it just gives
-	// a genuine race a chance to resolve before that guarantee is invoked.
-	for attempt := 0; attempt <= obsMaxRetries; attempt++ {
+	// Both "notexist" and "encoding" are retried, but on separate budgets:
+	// ErrOBSEncodingIncomplete uses the flat obsMaxRetries/obsRetryDelay
+	// window (an already-confirmed-exist object still transcoding).
+	// ErrOBSObjectNotFound uses the much longer obsNotFoundRetryDelays
+	// schedule (see its doc comment) — a self-sent file's object can report
+	// notexist for a moment while LINE's OBS write is still propagating
+	// (TASK-248), and an OA/broadcast-account object can plausibly take far
+	// longer than that to become visible (TASK-260). Retrying costs nothing
+	// when the object really is gone (identical outcome after exhaustion,
+	// just later), so treating notexist as retryable-then-final here does not
+	// weaken the "known expiry" guarantee mediaDownloadFailure depends on —
+	// it just gives a genuine race more time to resolve before that
+	// guarantee is invoked.
+	var encodingAttempts, notFoundAttempts int
+	for {
 		err = c.checkOBSObjectReady(ctx, objectInfoURL, obsToken, messageID)
 		if err == nil {
 			var data []byte
@@ -830,18 +870,27 @@ func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, servic
 				return data, nil
 			}
 		}
-		if !errors.Is(err, ErrOBSEncodingIncomplete) && !errors.Is(err, ErrOBSObjectNotFound) {
-			return nil, err
-		}
-		if attempt >= obsMaxRetries {
-			return nil, fmt.Errorf("%w after %d retries", err, obsMaxRetries)
-		}
-		if err = waitForOBSRetry(ctx); err != nil {
+		switch {
+		case errors.Is(err, ErrOBSEncodingIncomplete):
+			if encodingAttempts >= obsMaxRetries {
+				return nil, fmt.Errorf("%w after %d retries", err, encodingAttempts)
+			}
+			if waitErr := waitForOBSRetryDelay(ctx, obsRetryDelay); waitErr != nil {
+				return nil, waitErr
+			}
+			encodingAttempts++
+		case errors.Is(err, ErrOBSObjectNotFound):
+			if notFoundAttempts >= len(obsNotFoundRetryDelays) {
+				return nil, fmt.Errorf("%w after %d retries", err, notFoundAttempts)
+			}
+			if waitErr := waitForOBSRetryDelay(ctx, obsNotFoundRetryDelays[notFoundAttempts]); waitErr != nil {
+				return nil, waitErr
+			}
+			notFoundAttempts++
+		default:
 			return nil, err
 		}
 	}
-
-	return nil, fmt.Errorf("%w after %d retries", err, obsMaxRetries)
 }
 
 type obsObjectInfo struct {
@@ -930,11 +979,11 @@ func (c *Client) newOBSDownloadRequest(ctx context.Context, requestURL, obsToken
 	return req, nil
 }
 
-func waitForOBSRetry(ctx context.Context) error {
-	if obsRetryDelay <= 0 {
+func waitForOBSRetryDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
 		return nil
 	}
-	timer := time.NewTimer(obsRetryDelay)
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
